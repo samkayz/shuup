@@ -7,8 +7,12 @@
 # LICENSE file in the root directory of this source tree.
 from __future__ import unicode_literals
 
+import datetime
+
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from django.db.models import Q
+from django.utils.timezone import now
 from django.utils.translation import ugettext_lazy as _
 from parler_rest.fields import TranslatedFieldsField
 from parler_rest.serializers import TranslatableModelSerializer
@@ -29,11 +33,12 @@ from shuup.core.excs import ProductNotOrderableProblem
 from shuup.core.fields import (
     FORMATTED_DECIMAL_FIELD_DECIMAL_PLACES, FORMATTED_DECIMAL_FIELD_MAX_DIGITS
 )
-from shuup.core.models import Order
+from shuup.core.models import Basket
 from shuup.core.models import (
     get_company_contact, get_person_contact, MutableAddress, Order,
     OrderLineType, OrderStatus, Product, Shop, ShopProduct
 )
+from shuup.front.models import StoredBasket
 from shuup.utils.importing import cached_load
 
 
@@ -150,6 +155,12 @@ class BasketSerializer(serializers.Serializer):
         return basket.shop.id
 
 
+class StoredBasketSerializer(serializers.ModelSerializer):
+    class Meta:
+        fields = "__all__"
+        model = Basket
+
+
 class BaseProductAddBasketSerializer(serializers.Serializer):
     supplier = serializers.IntegerField(required=False)
     quantity = serializers.DecimalField(max_digits=FORMATTED_DECIMAL_FIELD_MAX_DIGITS,
@@ -223,7 +234,7 @@ class BasketViewSet(PermissionHelperMixin, viewsets.ViewSet):
 
     """
 
-    # just to make use of the convinient ViewSet class
+    # just to make use of the convenient ViewSet class
     queryset = Product.objects.none()
     lookup_field = "uuid"
 
@@ -253,7 +264,10 @@ class BasketViewSet(PermissionHelperMixin, viewsets.ViewSet):
                 # shop will be part of POST'ed data for basket creation
                 shop_id = self.request.data.get("shop")
             if not shop_id:
-                raise exceptions.ValidationError("No basket shop specified.")
+                try:
+                    shop_id = self.request.GET["shop"]
+                except:
+                    raise exceptions.ValidationError("No basket shop specified.")
             # this shop should be the shop associated with the basket
             return get_object_or_404(Shop, pk=shop_id)
         else:
@@ -271,6 +285,8 @@ class BasketViewSet(PermissionHelperMixin, viewsets.ViewSet):
         request.customer = (company or request.person)
         if with_basket:
             request.basket = self.get_object()
+            print("orderer", request.basket.orderer.pk, request.basket.customer.user.pk)
+            print("orderer self", self.request.basket.orderer.pk, self.request.basket.customer.user.pk)
 
     @schema_serializer_class(BasketSerializer)
     def retrieve(self, request, *args, **kwargs):
@@ -284,6 +300,19 @@ class BasketViewSet(PermissionHelperMixin, viewsets.ViewSet):
         uuid = get_key(self.kwargs.get(self.lookup_field, ""))
         basket_class = cached_load("SHUUP_BASKET_CLASS_SPEC")
         basket = basket_class(self.request._request, basket_name=uuid)
+        user = self.request.user
+        shop = self.request.shop
+        # check permissions to this basket
+        if not user.is_superuser:
+            # print("customer", type(basket.customer), basket.customer.user.pk, basket.customer.pk, user.pk)
+            if user.is_staff:
+                if not shop or not user.pk in shop.staff_members.all().values_list("pk", flat=True):
+                    raise exceptions.PermissionDenied("No permission")
+            else:
+                print(basket.creator.pk, basket.customer.user.pk)
+                print(user.pk, basket.key)
+                if basket.customer.user.pk != user.pk and basket.creator.pk != user.pk:
+                    raise exceptions.PermissionDenied("No permission")
         try:
             basket._data = basket.storage.load(basket)
         except BasketCompatibilityError as error:
@@ -299,9 +328,14 @@ class BasketViewSet(PermissionHelperMixin, viewsets.ViewSet):
         basket_class = cached_load("SHUUP_BASKET_CLASS_SPEC")
         basket = basket_class(request._request)
         if request.POST.get("customer_id"):
-            from shuup.core.models import PersonContact
-            customer = PersonContact.objects.get(pk=request.POST.get("customer_id"))
-            request.basket.customer = customer
+            is_staff = (not self.request.shop or not self.request.user.is_staff or
+                        not self.request.user.pk in self.request.shop.staff_members.all().values_list("pk", flat=True))
+            is_superuser = self.request.user.is_superuser
+            if is_superuser and is_staff:
+                from shuup.core.models import PersonContact
+                customer = PersonContact.objects.get(pk=request.POST.get("customer_id"))
+                basket.customer = customer
+                print("added customer to basket", basket.customer.pk, basket.customer.user.pk, basket.key)
         stored_basket = basket.save()
         return Response(data={"uuid": "%s-%s" % (request.shop.pk, stored_basket.key)}, status=status.HTTP_201_CREATED)
 
@@ -311,6 +345,30 @@ class BasketViewSet(PermissionHelperMixin, viewsets.ViewSet):
         cmd_kwargs = cmd_dispatcher.preprocess_kwargs(command, kwargs)
         response = cmd_handler(**cmd_kwargs)
         return cmd_dispatcher.postprocess_response(command, cmd_kwargs, response)
+
+    @list_route(methods=['get'])
+    def abandoned(self, request, *args, **kwargs):
+        self.process_request(with_basket=False)
+        days = int(request.GET.get("days_ago", 14))
+
+        days_ago = None
+        if days:
+            days_ago = now() - datetime.timedelta(days=days)
+
+        not_updated_in_hours = int(request.GET.get("not_updated_in_hours", 2))
+        late_cutoff = now() - datetime.timedelta(hours=not_updated_in_hours)
+
+        if days_ago:
+            updated_on_q = Q(updated_on__range=(days_ago, late_cutoff))
+        else:
+            updated_on_q = Q(updated_on__lte=late_cutoff)
+
+        stored_baskets = Basket.objects.filter(
+            shop=request.shop
+        ).filter(updated_on_q, product_count__gte=0).exclude(
+            deleted=True, finished=True, persistent=True
+        )
+        return Response(StoredBasketSerializer(stored_baskets, many=True).data)
 
     @schema_serializer_class(ProductAddBasketSerializer)
     @detail_route(methods=['post'])
@@ -454,9 +512,15 @@ class BasketViewSet(PermissionHelperMixin, viewsets.ViewSet):
             return Response({"errors": errors}, status=status.HTTP_400_BAD_REQUEST)
         order_creator = get_basket_order_creator()
         if request.POST.get("customer_id"):
-            from shuup.core.models import PersonContact
-            customer = PersonContact.objects.get(pk=request.POST.get("customer_id"))
-            request.basket.customer = customer
+            is_staff = (not self.request.shop or not self.request.user.is_staff or
+                        not self.request.user.pk in self.request.shop.staff_members.all().values_list("pk", flat=True))
+            is_superuser = self.request.user.is_superuser
+            if is_superuser and is_staff:
+                from shuup.core.models import PersonContact
+                customer = PersonContact.objects.get(pk=request.POST.get("customer_id"))
+                request.basket.customer = customer
+
+
         order = order_creator.create_order(request.basket)
         request.basket.finalize()
         return Response(data=OrderSerializer(order).data, status=status.HTTP_201_CREATED)
@@ -474,7 +538,8 @@ class BasketViewSet(PermissionHelperMixin, viewsets.ViewSet):
         self.clear(request, *args, **kwargs)
         for line in order.lines.products():
             try:
-                self._add_product(request, add_data={"product": line.product_id, "shop": order.shop_id, "quantity": line.quantity})
+                self._add_product(request, add_data={
+                    "product": line.product_id, "shop": order.shop_id, "quantity": line.quantity})
             except ValidationError as exc:
                 errors.append({exc.code: exc.message})
             except ProductNotOrderableProblem as exc:
